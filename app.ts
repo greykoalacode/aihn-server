@@ -4,15 +4,16 @@ import dotenv from "dotenv";
 import cron from "node-cron";
 import { Gist } from "./entities/Gist";
 import { HackerNewsService } from "./services/hacker-service";
-import { GeminiService } from "./services/gemini-service";
 import { GPTResponse } from "./entities/types/GPTResponse";
 import { Category } from "./entities/Category";
 import { Theme } from "./entities/Theme";
 import { In } from "typeorm";
 import { PostId } from "./entities/types/Item";
 import { queryParser } from "./middleware/queryparser";
+import { backoff } from './utils/exponential-fetch';
 import cors from "cors";
 import "reflect-metadata";
+import GeminiService from "./services/gemini-service";
 
 dotenv.config();
 
@@ -28,24 +29,28 @@ const port = 5000;
 // store it in postgresql
 AppDataSource.initialize()
   .then((dataSource) => {
-    console.log('tables created ')
+    console.log("DB connected successfully");
     const gistRepository = dataSource.getRepository(Gist);
     const categoryRepository = dataSource.getRepository(Category);
     const themeRepository = dataSource.getRepository(Theme);
 
+    // Services needed - HackerNews & Gemini
     const hackerNewsService = new HackerNewsService();
     const geminiService = new GeminiService(); // Or your summary API service
 
     async function processData() {
-      const allMappedPosts: PostId[] =
-        await hackerNewsService.fetchAllPostIds();
-        console.log('all ',allMappedPosts)
-      if (allMappedPosts) {
+      const allMappedPosts: PostId[] = await hackerNewsService.fetchAllPostIds();
+      if (allMappedPosts.length > 0) {
+        let post_count = 0;
         for (const post of allMappedPosts) {
-          const itemExists = await gistRepository.findOneBy({
+          const itemExists = await gistRepository.existsBy({
             itemId: post.id,
           });
+
+          // Create Gist if item doesn't exist already
           if (!itemExists) {
+
+            console.log("creating new gist...");
             console.log("fetching each story");
             const postDetails = await hackerNewsService.getPostDetails(post.id);
             if (postDetails) {
@@ -59,29 +64,34 @@ AppDataSource.initialize()
                 itemGist.time = postDetails.time;
                 itemGist.title = postDetails.title;
                 itemGist.description = postDetails?.text || "";
-                itemGist.score = postDetails?.score;
-                itemGist.storyURL = postDetails?.url;
-                itemGist.descendants = postDetails?.descendants;
+                itemGist.score = postDetails?.score || 0;
+                itemGist.storyURL = postDetails?.url || "";
+                itemGist.descendants = postDetails?.descendants || 0;
                 itemGist.type = post.type;
                 itemGist.url = `https://news.ycombinator.com/item?id=${post.id}`;
 
-                if (postDetails.title.split(" ").length > 3) {
+                if (hackerNewsService.checkValidPost(postDetails)) {
                   console.log("fetching output from Gemini ...");
-                  const aiResponse = await geminiService.generateForEachItem(
+                  const aiResponse = await backoff(() => geminiService.generateForEachItem(
                     postDetails
-                  );
+                  ), 0, 100);
                   if (aiResponse !== null) {
+                    console.log("ai " + aiResponse);
                     const response: GPTResponse = JSON.parse(aiResponse);
                     console.log("Response " + JSON.stringify(response));
 
-                    if (response.categories && response.categories.length > 0) {
+                    // filter the empty "" in categories / themes
+                    let categories = response.categories.filter(each => each.trim().length > 0);
+                    let themes = response.themes.filter(eachTheme => eachTheme.trim().length > 0);
+
+                    if (categories && categories.length > 0) {
                       const existingCategories = await categoryRepository.find({
                         where: {
-                          name: In(response.categories),
+                          name: In(categories),
                         },
                       }); // Check for existing categories
 
-                      const newCategories = response.categories.filter(
+                      const newCategories = categories.filter(
                         (name) =>
                           !existingCategories.some((cat) => cat.name === name)
                       ); // Find new categories
@@ -97,13 +107,13 @@ AppDataSource.initialize()
                       }
                     }
 
-                    if (response.themes && response.themes.length > 0) {
+                    if (themes && themes.length > 0) {
                       const existingThemes = await themeRepository.find({
                         where: {
-                          name: In(response.themes),
+                          name: In(themes),
                         },
                       }); // Check for existing themes
-                      const newThemes = response.themes.filter(
+                      const newThemes = themes.filter(
                         (name) =>
                           !existingThemes.some((theme) => theme.name === name)
                       ); // Find new themes
@@ -119,7 +129,7 @@ AppDataSource.initialize()
                       }
                     }
 
-                    if (response.summary && response.summary.length > 0) {
+                    if (response.summary && response.summary.trim().length > 0) {
                       itemGist.summary = response.summary;
                     }
                   }
@@ -127,6 +137,7 @@ AppDataSource.initialize()
 
                 // console.log(itemGist);
                 console.log("saving entity ....");
+                post_count += 1;
                 await gistRepository.save(itemGist);
               } catch (error) {
                 console.log(error);
@@ -134,13 +145,14 @@ AppDataSource.initialize()
             }
           }
         }
+        console.log(`${post_count} posts added at ` + new Date());
       }
     }
 
     // middleware
     app.use(express.json());
     app.use(express.urlencoded({ extended: false }));
-    const clientURLs = ["http://localhost:5173", "https://aihn.msurya.in"];
+    const clientURLs = ["http://localhost:3000", "https://aihn.msurya.in"];
     app.use(
       cors({
         origin: clientURLs,
@@ -162,7 +174,7 @@ AppDataSource.initialize()
       next();
     });
 
-    cron.schedule("*/3 * * * *", processData);
+    cron.schedule("*/15 * * * *", processData);
 
     // Endpoint to fetch results
     app.get("/results", queryParser, async (req, res) => {

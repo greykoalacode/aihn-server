@@ -51,7 +51,7 @@ export class Gist {
   url: string;
 
   @Column()
-  storyURL?: string = "";
+  storyURL?: string;
 
   @Column()
   by?: string;

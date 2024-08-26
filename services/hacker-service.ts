@@ -15,6 +15,8 @@ export class HackerNewsService {
       return null;
     }
   }
+
+
   async getTopPosts(): Promise<number[]> {
     return this.getPosts("top");
   }
@@ -85,5 +87,10 @@ export class HackerNewsService {
       console.error("Error fetching post details:", error);
       return null;
     }
+  }
+
+  checkValidPost(postDetails: Item): boolean {
+    let { title, text, url } = postDetails;
+    return title.split(" ").length >= 2 || text.split(" ").length >= 2 || url.length > 5;
   }
 }
